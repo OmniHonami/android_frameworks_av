@@ -731,6 +731,11 @@ void AudioTrack::pause()
 #ifdef QCOM_HARDWARE
     }
 #endif
+
+     if (isOffloaded()) {
+         sp<AudioTrackThread> t = mAudioTrackThread;
+         if (t != 0) t->pauseSync();
+     }
 }
 
 status_t AudioTrack::setVolume(float left, float right)
@@ -2088,7 +2093,7 @@ status_t AudioTrack::getTimeStamp(uint64_t *tstamp) {
 
 AudioTrack::AudioTrackThread::AudioTrackThread(AudioTrack& receiver, bool bCanCallJava)
     : Thread(bCanCallJava), mReceiver(receiver), mPaused(true), mPausedInt(false), mPausedNs(0LL),
-      mIgnoreNextPausedInt(false)
+      mIgnoreNextPausedInt(false), mCmdAckPending(false)
 {
 }
 
@@ -2101,6 +2106,10 @@ bool AudioTrack::AudioTrackThread::threadLoop()
     {
         AutoMutex _l(mMyLock);
         if (mPaused) {
+            if (mCmdAckPending) {
+                mCmdAckPending = false;
+                mCmdAck.signal();
+            }
             mMyCond.wait(mMyLock);
             // caller will check for exitPending()
             return true;
@@ -2110,6 +2119,10 @@ bool AudioTrack::AudioTrackThread::threadLoop()
             mPausedInt = false;
         }
         if (mPausedInt) {
+            if (mCmdAckPending) {
+                mCmdAckPending = false;
+                mCmdAck.signal();
+            }
             if (mPausedNs > 0) {
                 (void) mMyCond.waitRelative(mMyLock, mPausedNs);
             } else {
@@ -2152,10 +2165,24 @@ void AudioTrack::AudioTrackThread::pause()
     mPaused = true;
 }
 
+void AudioTrack::AudioTrackThread::pauseSync()
+{
+    AutoMutex _l(mMyLock);
+    if (mPaused || mPausedInt)
+        return;
+
+    mPaused = true;
+    mCmdAckPending = true;
+    while (!mCmdAckPending) {
+        mCmdAck.wait(mMyLock);
+    }
+}
+
 void AudioTrack::AudioTrackThread::resume()
 {
     AutoMutex _l(mMyLock);
     mIgnoreNextPausedInt = true;
+    mCmdAckPending = false;
     if (mPaused || mPausedInt) {
         mPaused = false;
         mPausedInt = false;
